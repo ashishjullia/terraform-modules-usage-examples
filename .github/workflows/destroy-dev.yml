@@ -1,0 +1,64 @@
+name: Destroy Dev
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'destroy-dev-*'
+
+env:
+  STAGE: dev
+  TF_STATE_BUCKET_NAME: ${{ vars.TF_STATE_BUCKET_NAME }}
+  TF_STATE_BUCKET_KEY: "${{ github.event.repository.name }}/dev/terraform.tfstate"
+  TF_STATE_BUCKET_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_DYNAMODB_TABLE_NAME: ${{ vars.TF_STATE_DYNAMODB_TABLE_NAME }}
+  TF_STATE_DYNAMODB_TABLE_REGION: ${{ vars.AWS_REGION }}
+
+permissions:
+  id-token: write   # This is required for requesting the JWT for step AWS Configure
+  contents: write    # This is required for actions/checkout and release delete
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup AWS CLI for "gh actions" user
+        id: ghactions
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          role-to-assume: ${{ vars.EQ_PROD_CD_EQ_MWAA_DEV_ROLE }}
+          role-session-name: "${{ github.run_id }}-${{ github.sha }}"
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Get Terraform Version
+        run: |
+          echo "TF_VERSION=$(head -n 1 .terraform-version)" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        id: init
+        run: |
+            terraform init -lockfile=readonly \
+              -backend-config="bucket=$TF_STATE_BUCKET_NAME" \
+              -backend-config="key=$TF_STATE_BUCKET_KEY" \
+              -backend-config="region=$TF_STATE_BUCKET_REGION" \
+              -backend-config="dynamodb_table=$TF_STATE_DYNAMODB_TABLE_NAME"
+
+      # validates the configuration files in a directory, referring only to the configuration 
+      # and not accessing any remote services such as remote state, provider APIs, etc.
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: Terraform Destroy
+        id: destroy
+        if: steps.validate.outcome == 'success'
+        run: |
+          terraform destroy -auto-approve -var-file="${{ env.STAGE }}.tfvars"
+        

@@ -1,0 +1,215 @@
+name: Deploy Dev
+
+on:
+  push:
+    tags:
+      - 'dev-*'
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+
+env:
+  STAGE: dev
+  TF_STATE_BUCKET_NAME: ${{ vars.TF_STATE_BUCKET_NAME }}
+  TF_STATE_BUCKET_KEY: "${{ github.event.repository.name }}/dev/terraform.tfstate"
+  TF_STATE_BUCKET_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_DYNAMODB_TABLE_NAME: ${{ vars.TF_STATE_DYNAMODB_TABLE_NAME }}
+  TF_STATE_DYNAMODB_TABLE_REGION: ${{ vars.AWS_REGION }}
+  WORKING_CODE_REPO: ${{ github.repository }}
+  WORKING_CODE_REPO_WITHOUT_OWNER: ${{ github.event.repository.name }}
+  WORKING_CODE_REPO_OWNER: ${{ github.event.repository.owner.name }}
+
+permissions:
+  id-token: write   # This is required for requesting the JWT for step AWS Configure
+  contents: write    # This is required for actions/checkout
+  pull-requests: write
+  issues: write
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup AWS CLI for "gh actions" user
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE }}
+          role-session-name: "${{ github.run_id }}-${{ github.sha }}"
+          aws-region: ${{ vars.AWS_REGION }}
+          # This should either match the max from aws console or in default cases minium is always set to 1 hour
+          # For this one and nature of the MWAA create/update timeout, increased the time at role level and this action token level
+          # 14400 == 4 hours
+          # role-duration-seconds: 14400
+
+      - name: Setup TF backend (Create if it does not exists)
+        run: |
+          tfStateBucketName=$TF_STATE_BUCKET_NAME
+          tfStateBucketRegion=$TF_STATE_BUCKET_REGION
+          tfStateBucketExistence=$(aws s3 ls | grep $tfStateBucketName | awk '{print $3}')
+
+          tfStateDyanmoDBTableName=$TF_STATE_DYNAMODB_TABLE_NAME
+          tfStateDyanmoDBTableRegion=$TF_STATE_DYNAMODB_TABLE_REGION
+          tfStateDyanmoDBTableExistence=$(aws dynamodb list-tables --region=$tfStateDyanmoDBTableRegion --output text | grep $tfStateDyanmoDBTableName | awk '{print $2}')
+
+          if [ "$tfStateBucketExistence" == "$tfStateBucketName" ]
+          then
+              echo "The $tfStateBucketName bucket already exists."
+          else
+              aws s3api create-bucket \
+                  --bucket $tfStateBucketName \
+                  --region $tfStateBucketRegion \
+                  --create-bucket-configuration LocationConstraint=$tfStateBucketRegion
+
+              # not needed if the region is us-east-1
+              # --create-bucket-configuration LocationConstraint=$tfStateBucketRegion
+
+              aws s3api put-bucket-versioning \
+                  --bucket $tfStateBucketName \
+                  --versioning-configuration Status=Enabled
+
+              aws s3api put-bucket-encryption \
+                  --bucket $tfStateBucketName \
+                  --server-side-encryption-configuration '{"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}'
+
+              aws s3api put-public-access-block \
+                  --bucket $tfStateBucketName \
+                  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+          fi
+
+          if [ "$tfStateDyanmoDBTableExistence" == "$tfStateDyanmoDBTableName" ]
+          then
+              echo "The $tfStateDyanmoDBTableName dynmoDB table already exists."
+          else
+              aws dynamodb create-table \
+                  --table-name $tfStateDyanmoDBTableName \
+                  --region $tfStateDyanmoDBTableRegion \
+                  --attribute-definitions AttributeName=LockID,AttributeType=S \
+                  --key-schema AttributeName=LockID,KeyType=HASH \
+                  --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 \
+                  --tags Key=Owner,Value=tf \
+                  --output text
+              
+              sleep 40s
+          fi
+
+      - name: Get Terraform Version from .terraform-version file
+        run: |
+          echo "TF_VERSION=$(head -n 1 .terraform-version)" >> $GITHUB_ENV
+
+      - name: Build Lambda Package
+        run: |
+          echo "Ensuring packaging script is executable..."
+          chmod +x ./modules/rds/intermediate/build/package_lambda.sh
+
+          echo "Running Lambda packaging script..."
+          ./modules/rds/intermediate/build/package_lambda.sh ./modules/rds/intermediate/build
+
+          echo "Verifying build output..."
+          ls -la ./modules/rds/intermediate/build # List contents for debugging
+          if [ ! -d "./modules/rds/intermediate/build/node_modules/pg" ]; then
+            echo "ERROR: node_modules/pg directory not found after build!"
+            exit 1
+          fi
+          echo "Build output verified."
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Check Terraform configuration files to a canonical format and style
+      - name: Check Terraform Code Format
+        id: fmt
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        id: init
+        run: | 
+          terraform -v
+          terraform init -lockfile=readonly \
+              -backend-config="bucket=$TF_STATE_BUCKET_NAME" \
+              -backend-config="key=$TF_STATE_BUCKET_KEY" \
+              -backend-config="region=$TF_STATE_BUCKET_REGION" \
+              -backend-config="dynamodb_table=$TF_STATE_DYNAMODB_TABLE_NAME"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      # validates the configuration files in a directory, referring only to the configuration 
+      # and not accessing any remote services such as remote state, provider APIs, etc.
+      - name: Validate Terraform Code
+        id: validate
+        run: terraform validate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Generate Terraform Plan
+        id: plan
+        if: steps.init.outcome == 'success'
+        run: |
+          terraform plan -no-color -input=false -detailed-exitcode -out=${{ env.STAGE }}.tfplan -var-file="${{ env.STAGE }}.tfvars"
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      # This will only run on a "Pull Request"
+      - name: Update Pull Request
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### STAGE \`${{ env.STAGE }}\`
+            #### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Current WF run date
+        run: echo "WF_RUN_DATE=$(date +'%Y-%m-%dT%H:%M:%S')" >> $GITHUB_ENV
+        
+      - name: Manual Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.CD_READ_ORG_USERS_FOR_MANUAL_APPROVAL_GH_ACTION }}
+          # comma-delimited list of all required approvers
+          approvers: ${{ vars.APPROVERS }}
+          minimum-approvals: 1
+          issue-title: "${{ github.workflow }}-${{ github.sha }}-${{ env.WF_RUN_DATE }}" 
+
+      - name: Terraform Apply
+        id: apply
+        run: |
+          terraform apply -auto-approve -input=false "${{ env.STAGE }}.tfplan"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
